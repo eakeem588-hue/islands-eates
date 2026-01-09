@@ -13,4 +13,269 @@ island-eats/
         ├── api.js
         ├── Track.js
         └── DriverDashboard.js
+FROM node:18
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+
+EXPOSE 4000
+
+CMD ["npm", "start"]
+{
+  "name": "island-eats-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "body-parser": "^1.20.2",
+    "pg": "^8.11.1"
+  }
+}
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const { Pool } = require("pg");
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+// Postgres connection (ready for future use)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL
+});
+
+// In-memory data for MVP
+let orders = [];
+let restaurants = [
+  { id: "r1", name: "Jerkshore", lat: 18.0123, lng: -76.8010 }
+];
+let users = [];
+let drivers = [];
+
+// HTTP + Socket.IO
+const http = require("http").createServer(app);
+const io = require("socket.io")(http, { cors: { origin: "*" } });
+
+io.on("connection", socket => {
+  socket.on("join-order", orderId => {
+    socket.join(orderId);
+  });
+});
+
+// Helpers
+function createOrderId() {
+  return "o" + Math.floor(Math.random() * 1000000);
+}
+
+// Routes
+app.get("/api", (req, res) => res.json({ ok: true }));
+
+app.post("/api/users", (req, res) => {
+  const user = { id: "u" + (users.length + 1), ...req.body };
+  users.push(user);
+  res.json(user);
+});
+
+app.post("/api/drivers", (req, res) => {
+  const driver = { id: "d" + (drivers.length + 1), ...req.body };
+  drivers.push(driver);
+  res.json(driver);
+});
+
+app.get("/api/restaurants", (req, res) => res.json(restaurants));
+
+app.post("/api/orders", (req, res) => {
+  const { userId, restaurantId, items, customer } = req.body;
+  const id = createOrderId();
+  const restaurant = restaurants.find(r => r.id === restaurantId);
+
+  const order = {
+    id,
+    userId,
+    restaurantId,
+    restaurant,
+    items,
+    customer,
+    status: "pending",
+    driverId: null,
+    driverLocation: { lat: null, lng: null, updatedAt: null },
+    eta: null,
+    route: [],
+    createdAt: Date.now()
+  };
+
+  orders.push(order);
+  res.json(order);
+});
+
+app.get("/api/orders/:id", (req, res) => {
+  const order = orders.find(o => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  res.json(order);
+});
+
+app.get("/api/driver/orders", (req, res) => {
+  const available = orders.filter(o => !o.driverId);
+  res.json(available);
+});
+
+app.post("/api/orders/:id/accept", (req, res) => {
+  const order = orders.find(o => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+
+  const { driverId } = req.body || { driverId: "d1" };
+  order.driverId = driverId;
+  order.status = "assigned";
+
+  io.to(order.id).emit("status-update", { status: order.status });
+  res.json(order);
+});
+
+app.post("/api/orders/:id/location", (req, res) => {
+  const order = orders.find(o => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+
+  const { lat, lng } = req.body;
+  order.driverLocation = { lat, lng, updatedAt: Date.now() };
+
+  io.to(order.id).emit("location-update", order.driverLocation);
+  res.json({ success: true });
+});
+
+http.listen(4000, () => {
+  console.log("Island Eats API running at http://localhost:4000/api");
+});
+FROM node:18
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+
+EXPOSE 3000
+
+CMD ["npm", "start"]
+{
+  "name": "island-eats-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.22.0",
+    "socket.io-client": "^4.7.2",
+    "leaflet": "^1.9.4",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start"
+  }
+}
+import React from "react";
+import ReactDOM from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+import App from "./App";
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(
+  <BrowserRouter>
+    <App />
+  </BrowserRouter>
+);
+const BASE = process.env.REACT_APP_API_URL || "http://localhost:4000/api";
+
+export async function api(path, options = {}) {
+  const res = await fetch(BASE + path, {
+    headers: { "Content-Type": "application/json" },
+    ...options
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+import React from "react";
+import { Routes, Route, Link, useNavigate } from "react-router-dom";
+import { api } from "./api";
+import Track from "./Track";
+import DriverDashboard from "./DriverDashboard";
+
+function Home() {
+  const navigate = useNavigate();
+
+  async function createDemoOrder() {
+    const user = await api("/users", {
+      method: "POST",
+      body: JSON.stringify({ name: "Demo User" })
+    });
+
+    const order = await api("/orders", {
+      method: "POST",
+      body: JSON.stringify({
+        userId: user.id,
+        restaurantId: "r1",
+        items: [{ name: "Jerk Chicken Plate", price: 1600 }],
+        customer: { name: "Demo User", lat: 18.005, lng: -76.79 }
+      })
+    });
+
+    localStorage.setItem("lastOrderId", order.id);
+    navigate("/track");
+  }
+
+  return (
+    <div style={{ padding: 20 }}>
+      <h1>Island Eats Jamaica</h1>
+      <button onClick={createDemoOrder}>Create Demo Order</button>
+      <div style={{ marginTop: 20 }}>
+        <Link to="/driver">Driver Dashboard</Link>
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<Home />} />
+      <Route path="/track" element={<Track />} />
+      <Route path="/driver" element={<DriverDashboard />} />
+    </Routes>
+  );
+}
+import React, { useEffect, useState } from "react";
+import { api } from "./api";
+
+export default function DriverDashboard() {
+  const [orders, setOrders] = useState([]);
+
+  async function loadOrders() {
+    const data = await api("/driver/orders");
+    setOrders(data);
+  }
+
+  useEffect(() => {
+    loadOrders();
+  }, []);
+
+  function startLocationTracking(orderId) {
+    if (!navigator.geolocation) {
+      alert("Location not supported");
+      return;
+    }
+
+    navigator.geolocation.watchPosition(async (pos) => {
+      await api(`/orders/${orderId}/location`, {
+        method: "POST",
+        body: JSON.stringify({
 
